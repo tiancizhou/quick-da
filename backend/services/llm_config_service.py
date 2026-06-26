@@ -28,6 +28,10 @@ class LLMSettingsSummary:
     source: LLM_CONFIG_SOURCES
 
 
+class LLMConfigurationError(ValueError):
+    pass
+
+
 def mask_api_key(api_key: str | None) -> str | None:
     if not api_key:
         return None
@@ -59,6 +63,23 @@ def resolve_effective_llm_settings(db: Session, settings: Settings) -> Effective
         LLM_API_KEY=settings.LLM_API_KEY,
         source="env",
     )
+
+
+def require_effective_llm_settings(db: Session, settings: Settings) -> EffectiveLLMSettings:
+    effective = resolve_effective_llm_settings(db, settings)
+    missing = []
+    if not (effective.LLM_BASE_URL or "").strip():
+        missing.append("Base URL")
+    if not (effective.LLM_MODEL or "").strip():
+        missing.append("模型名称")
+    if not (effective.LLM_API_KEY or "").strip():
+        missing.append("API Key")
+    if missing:
+        raise LLMConfigurationError(
+            f"模型配置未完成：请填写{'、'.join(missing)}。"
+            "可在后台管理的模型配置中保存，或在根目录 .env 中配置后重启服务。"
+        )
+    return effective
 
 
 def summarize_effective_llm_settings(db: Session, settings: Settings) -> LLMSettingsSummary:

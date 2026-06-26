@@ -1,0 +1,41 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-quickapp}"
+      POSTGRES_USER: "${POSTGRES_USER:-quickapp}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-quickapp_password}"
+    volumes:
+      - quick-da-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${SERVER_PORT:-8000}:8000"
+    environment:
+      SERVER_PORT: "8000"
+      DATA_DIR: /app/data
+      DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER:-quickapp}:${POSTGRES_PASSWORD:-quickapp_password}@db:5432/${POSTGRES_DB:-quickapp}"
+      GENERATION_MAX_CONCURRENT: "${GENERATION_MAX_CONCURRENT:-10}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-https://api.openai.com/v1}"
+      LLM_MODEL: "${LLM_MODEL:-gpt-4o-mini}"
+      LLM_STREAMING: "${LLM_STREAMING:-false}"
+    volumes:
+      - quick-da-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  quick-da-data:
+  quick-da-postgres:

@@ -243,6 +243,63 @@ class LLMSettingsTestCase(unittest.TestCase):
         finally:
             db.close()
 
+    def test_generation_returns_actionable_error_when_llm_api_key_is_missing(self):
+        db = self.database.SessionLocal()
+        try:
+            db.add(self.models.Employee(employee_no="64033", name="缺少密钥", status="active"))
+            db.add(self.models.User(
+                employee_no="64033",
+                password_hash=self.models.hash_password("123456"),
+                is_admin=False,
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        self.client.post("/api/auth/login", json={"employee_no": "64033", "password": "123456"})
+        create_resp = self.client.post("/api/apps")
+        self.assertEqual(201, create_resp.status_code)
+        app_id = create_resp.json()["id"]
+
+        from config import Settings
+        from services import ai_service, app_service
+
+        async def stream_should_not_run(messages, settings):
+            raise AssertionError("LLM should not be called when API Key is missing")
+            yield ai_service.StreamChatEvent(content="")
+
+        db_gen = self.database.SessionLocal()
+        try:
+            app = db_gen.query(self.models.App).filter(self.models.App.id == app_id).first()
+            settings = Settings(
+                LLM_API_KEY="",
+                LLM_BASE_URL="https://env.example.test/v1",
+                LLM_MODEL="env-model",
+                DATA_DIR=str(Path(self.tmp.name) / "data"),
+            )
+            with patch.object(ai_service, "stream_chat_events", stream_should_not_run):
+                events = []
+
+                async def _run():
+                    async for event in app_service.handle_chat(app, "生成缺少密钥测试页", db_gen, settings):
+                        events.append(event)
+
+                asyncio.run(_run())
+        finally:
+            db_gen.close()
+
+        self.assertTrue(any("模型配置未完成" in event for event in events))
+        self.assertTrue(any("API Key" in event for event in events))
+
+        db = self.database.SessionLocal()
+        try:
+            app = db.query(self.models.App).filter(self.models.App.id == app_id).first()
+            self.assertEqual("failed", app.status)
+            self.assertIsNone(app.progress)
+            self.assertEqual(0, db.query(self.models.UsageRecord).filter(self.models.UsageRecord.app_id == app_id).count())
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

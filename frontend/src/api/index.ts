@@ -10,6 +10,7 @@ export interface App {
   project_type: "html" | "project"
   visibility: "private" | "public" | "token"
   preview_token?: string | null
+  opencode_session_id?: string | null
   version: number
   created_at: string
   updated_at: string
@@ -91,6 +92,19 @@ export interface LLMSettingsUpdate {
 }
 
 export type DevicePreference = "mobile" | "desktop" | "responsive"
+
+export interface OpenCodeStreamEvent {
+  type?: "opencode"
+  kind: string
+  [key: string]: unknown
+}
+
+export interface OpenCodeEventRecord {
+  sequence: number
+  event_type: string
+  payload: OpenCodeStreamEvent
+  created_at: string
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
@@ -209,6 +223,10 @@ export async function listConversations(appId: string): Promise<Conversation[]> 
   return request<Conversation[]>(`/apps/${appId}/conversations`)
 }
 
+export async function listOpenCodeEvents(appId: string): Promise<OpenCodeEventRecord[]> {
+  return request<OpenCodeEventRecord[]>(`/apps/${appId}/opencode-events`)
+}
+
 export async function getAppPreview(appId: string): Promise<{ url: string }> {
   return request<{ url: string }>(`/apps/${appId}/preview`)
 }
@@ -230,6 +248,7 @@ export async function sendChat(
   devicePreference: DevicePreference,
   onChunk: (content: string) => void,
   onProgress: (progress: string) => void,
+  onOpenCode: (event: OpenCodeStreamEvent) => void,
   onResult: (url: string | null, status: string, error?: string | null) => void,
 ): Promise<void> {
   const res = await fetch(`${BASE}/apps/${appId}/chat`, {
@@ -270,6 +289,8 @@ export async function sendChat(
             onChunk(parsed.content ?? "")
           } else if (currentEvent === "progress") {
             onProgress(parsed.content ?? "")
+          } else if (currentEvent === "opencode") {
+            onOpenCode(parsed)
           } else if (currentEvent === "result") {
             onResult(parsed.url ?? null, parsed.status ?? "failed", parsed.error ?? null)
           }
@@ -291,6 +312,8 @@ export async function sendChat(
         const parsed = JSON.parse(raw)
         if (currentEvent === "message") {
           onChunk(parsed.content ?? "")
+        } else if (currentEvent === "opencode") {
+          onOpenCode(parsed)
         } else if (currentEvent === "result") {
           onResult(parsed.url ?? null, parsed.status ?? "failed", parsed.error ?? null)
         }

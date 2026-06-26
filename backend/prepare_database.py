@@ -33,8 +33,28 @@ def upgrade_database() -> None:
     command.upgrade(alembic_cfg, "head")
 
 
+def recover_interrupted_apps() -> None:
+    from database import SessionLocal
+    from models import App
+
+    db = SessionLocal()
+    try:
+        db.query(App).filter(App.status == "creating").update(
+            {"status": "failed", "progress": None},
+            synchronize_session=False,
+        )
+        db.query(App).filter(App.status == "editing").update(
+            {"status": "edit_failed", "progress": None},
+            synchronize_session=False,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def main() -> None:
     upgrade_database()
+    recover_interrupted_apps()
 
 
 if __name__ == "__main__":

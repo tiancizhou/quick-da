@@ -339,60 +339,56 @@ class AuthTestCase(unittest.TestCase):
         from config import Settings
         from services import ai_service, app_service
 
-        next_files = [
+        react_files = [
             {
                 "path": "package.json",
-                "content": '{"scripts":{"build":"next build"},"dependencies":{"next":"latest","react":"latest","react-dom":"latest"},"devDependencies":{"typescript":"latest","@types/node":"latest","@types/react":"latest","@types/react-dom":"latest"}}',
+                "content": '{"scripts":{"dev":"vite","build":"vite build","preview":"vite preview"},"dependencies":{"@vitejs/plugin-react":"latest","vite":"latest","typescript":"latest","react":"latest","react-dom":"latest","appwrite":"latest"},"devDependencies":{}}',
             },
-            {"path": "next.config.ts", "content": "const nextConfig = { output: 'export', assetPrefix: './', images: { unoptimized: true } }; export default nextConfig;"},
-            {"path": "tsconfig.json", "content": "{}"},
-            {"path": "next-env.d.ts", "content": "/// <reference types=\"next\" />"},
-            {"path": "app/layout.tsx", "content": "import './globals.css'; export default function RootLayout({ children }) { return <html><body>{children}</body></html>; }"},
-            {"path": "app/page.tsx", "content": "export default function Page() { return <main>ok</main>; }"},
-            {"path": "app/globals.css", "content": "body { color: green; }"},
+            {"path": "index.html", "content": "<div id=\"root\"></div><script type=\"module\" src=\"/src/main.tsx\"></script>"},
+            {"path": "src/main.tsx", "content": "import React from 'react'; import { createRoot } from 'react-dom/client'; import App from './App'; createRoot(document.getElementById('root')!).render(<App />);"},
+            {"path": "src/App.tsx", "content": "export default function App() { return <main>ok</main>; }"},
+            {"path": "src/styles.css", "content": "body { color: green; }"},
+            {"path": ".env.example", "content": "VITE_APPWRITE_ENDPOINT=\nVITE_APPWRITE_PROJECT_ID=\nVITE_APPWRITE_DATABASE_ID=\n"},
         ]
-        project_reply = json.dumps({"files": next_files})
-
-        async def stream_project(messages, settings):
-            yield ai_service.StreamChatEvent(content=project_reply)
-            yield ai_service.StreamChatEvent(usage=ai_service.TokenUsage(prompt_tokens=11, completion_tokens=7, total_tokens=18))
 
         db_gen = self.database.SessionLocal()
         try:
             app = db_gen.query(self.models.App).filter(self.models.App.id == app_id).first()
-            def fake_build(source_dir):
-                out_dir = source_dir / "out"
-                static_dir = out_dir / "_next" / "static" / "chunks"
-                static_dir.mkdir(parents=True, exist_ok=True)
-                (out_dir / "index.html").write_text("<html><script src='_next/static/chunks/app.js'></script></html>", encoding="utf-8")
-                (static_dir / "app.js").write_text("console.log('ok')", encoding="utf-8")
-                return out_dir
 
-            with patch.object(ai_service, "stream_chat_events", stream_project):
-                with patch.object(app_service.code_service, "build_static_export", fake_build):
-                    with patch.object(
-                        ai_service,
-                        "non_streaming_chat_with_usage",
-                        return_value=ai_service.ChatResult(
-                            content="项目",
-                            usage=ai_service.TokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
-                        ),
-                    ):
-                        events = []
-                        async def _run():
-                            async for event in app_service.handle_chat(app, "生成多页面项目", db_gen, Settings()):
-                                events.append(event)
-                        asyncio.run(_run())
+            def fake_opencode(**kwargs):
+                self.assertTrue(kwargs["reset_workspace"])
+                on_event = kwargs["on_event"]
+                on_event("opencode", {"kind": "session", "sessionID": "session-1", "providerID": "quickda", "modelID": "test-model"})
+                on_event("opencode", {"kind": "assistant_delta", "content": "我会生成 React 项目。"})
+                on_event("opencode", {"kind": "tool", "tool": "write", "status": "completed", "input": {"filePath": "src/App.tsx"}})
+                on_event("opencode", {"kind": "file", "file": "src/App.tsx", "event": "edited"})
+                return react_files
+
+            with patch.object(app_service.code_service, "generate_static_frontend_with_opencode", side_effect=fake_opencode):
+                with patch.object(
+                    ai_service,
+                    "non_streaming_chat_with_usage",
+                    return_value=ai_service.ChatResult(
+                        content="项目",
+                        usage=ai_service.TokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5),
+                    ),
+                ):
+                    events = []
+                    async def _run():
+                        async for event in app_service.handle_chat(app, "生成多页面项目", db_gen, Settings()):
+                            events.append(event)
+                    asyncio.run(_run())
         finally:
             db_gen.close()
 
         app_dir = Path(self.tmp.name) / "data" / "apps" / app_id
         source_dir = app_dir / "source"
         project_dir = app_dir / "project"
-        self.assertEqual("body { color: green; }", (source_dir / "app" / "globals.css").read_text(encoding="utf-8"))
-        self.assertTrue((project_dir / "index.html").is_file())
-        self.assertTrue((project_dir / "_next" / "static" / "chunks" / "app.js").is_file())
-        self.assertTrue(any(f"/generated/{app_id}/project/index.html" in event for event in events))
+        self.assertEqual("body { color: green; }", (source_dir / "src" / "styles.css").read_text(encoding="utf-8"))
+        self.assertTrue((source_dir / "src" / "App.tsx").is_file())
+        self.assertFalse(project_dir.exists())
+        self.assertTrue(any('"event": "opencode"' in event or event.startswith("event: opencode") for event in events))
+        self.assertTrue(any('"status": "active"' in event for event in events))
 
         db = self.database.SessionLocal()
         try:
@@ -402,23 +398,35 @@ class AuthTestCase(unittest.TestCase):
             self.assertTrue(all(record.total_tokens > 0 for record in usage))
             usage_by_action = {record.action: record for record in usage}
             self.assertEqual(5, usage_by_action["name"].total_tokens)
-            self.assertEqual(18, usage_by_action["generate"].total_tokens)
+            self.assertGreater(usage_by_action["generate"].total_tokens, 0)
             self.assertFalse(usage_by_action["name"].is_estimated)
-            self.assertFalse(usage_by_action["generate"].is_estimated)
+            self.assertTrue(usage_by_action["generate"].is_estimated)
             for record in usage:
                 self.assertEqual("unknown", record.provider)
                 self.assertEqual(0, float(record.cost))
+
+            generated_app = db.query(self.models.App).filter(self.models.App.id == app_id).first()
+            self.assertEqual("active", generated_app.status)
+            self.assertEqual("session-1", generated_app.opencode_session_id)
+            self.assertEqual("source/package.json", generated_app.entry_path)
+            self.assertEqual(4, db.query(self.models.OpenCodeEvent).filter(self.models.OpenCodeEvent.app_id == app_id).count())
 
             assistant_message = db.query(self.models.Conversation).filter(
                 self.models.Conversation.app_id == app_id,
                 self.models.Conversation.role == "assistant",
             ).first()
             self.assertIsNotNone(assistant_message)
-            self.assertEqual("应用已生成或更新，可以在右侧预览。", assistant_message.content)
+            self.assertIn("OpenCode 智能体会话已完成", assistant_message.content)
+            self.assertIn("src/App.tsx", assistant_message.content)
             self.assertNotIn('"files"', assistant_message.content)
             self.assertNotIn("css/style.css", assistant_message.content)
         finally:
             db.close()
+
+        opencode_events_response = self.client.get(f"/api/apps/{app_id}/opencode-events")
+        self.assertEqual(200, opencode_events_response.status_code)
+        payloads = [record["payload"] for record in opencode_events_response.json()]
+        self.assertEqual(["session", "assistant_delta", "tool", "file"], [payload["kind"] for payload in payloads])
 
     def test_project_messages_include_device_preference_prompt(self):
         from config import Settings
@@ -463,17 +471,13 @@ class AuthTestCase(unittest.TestCase):
         import asyncio
         from unittest.mock import patch
         from config import Settings
-        from services import ai_service, app_service
-
-        async def stream_should_not_run(messages, settings):
-            raise AssertionError("LLM should not be called when generation limit is reached")
-            yield ai_service.StreamChatEvent(content="")
+        from services import app_service
 
         db_gen = self.database.SessionLocal()
         try:
             app = db_gen.query(self.models.App).filter(self.models.App.id == app_id).first()
             settings = Settings(GENERATION_MAX_CONCURRENT=0)
-            with patch.object(ai_service, "stream_chat_events", stream_should_not_run):
+            with patch.object(app_service.code_service, "generate_static_frontend_with_opencode", side_effect=AssertionError("OpenCode should not run")):
                 events = []
                 async def _run():
                     async for event in app_service.handle_chat(app, "生成限流页", db_gen, settings):
@@ -518,14 +522,14 @@ class AuthTestCase(unittest.TestCase):
         from config import Settings
         from services import ai_service, app_service
 
-        async def invalid_stream(messages, settings):
-            yield ai_service.StreamChatEvent(content="not json and not html")
-            yield ai_service.StreamChatEvent(usage=ai_service.TokenUsage(prompt_tokens=8, completion_tokens=4, total_tokens=12))
-
         db_gen = self.database.SessionLocal()
         try:
             app = db_gen.query(self.models.App).filter(self.models.App.id == app_id).first()
-            with patch.object(ai_service, "stream_chat_events", invalid_stream):
+            with patch.object(
+                app_service.code_service,
+                "generate_static_frontend_with_opencode",
+                side_effect=app_service.code_service.ProjectValidationError("OpenCode 没有生成可保存的 React 前端源码。"),
+            ):
                 with patch.object(ai_service, "non_streaming_chat_with_usage", return_value=ai_service.ChatResult(content="坏输出")):
                     async def _run():
                         async for _ in app_service.handle_chat(app, "生成坏输出", db_gen, Settings()):
@@ -542,8 +546,8 @@ class AuthTestCase(unittest.TestCase):
             ).first()
             self.assertIsNotNone(usage)
             self.assertEqual("failed", usage.status)
-            self.assertEqual(12, usage.total_tokens)
-            self.assertFalse(usage.is_estimated)
+            self.assertGreater(usage.total_tokens, 0)
+            self.assertTrue(usage.is_estimated)
         finally:
             db.close()
 
@@ -570,14 +574,10 @@ class AuthTestCase(unittest.TestCase):
         from config import Settings
         from services import ai_service, app_service
 
-        async def failing_stream(messages, settings):
-            yield ai_service.StreamChatEvent(content="partial")
-            raise RuntimeError("provider failed")
-
         db_gen = self.database.SessionLocal()
         try:
             app = db_gen.query(self.models.App).filter(self.models.App.id == app_id).first()
-            with patch.object(ai_service, "stream_chat_events", failing_stream):
+            with patch.object(app_service.code_service, "generate_static_frontend_with_opencode", side_effect=RuntimeError("provider failed")):
                 with patch.object(ai_service, "non_streaming_chat_with_usage", return_value=ai_service.ChatResult(content="失败页")):
                     async def _run():
                         async for _ in app_service.handle_chat(app, "生成失败页", db_gen, Settings()):
@@ -619,14 +619,6 @@ class AuthTestCase(unittest.TestCase):
         import asyncio
         import threading
         from unittest.mock import patch
-        from services import ai_service
-
-        html_body = "```html\n<!DOCTYPE html><html><body>Hello</body></html>\n```"
-
-        async def slow_stream(messages, settings):
-            for word in html_body.split():
-                yield ai_service.StreamChatEvent(content=word + " ")
-            yield ai_service.StreamChatEvent(content="\n")
 
         generation_done = threading.Event()
 
@@ -635,11 +627,15 @@ class AuthTestCase(unittest.TestCase):
                 from database import SessionLocal as SL
                 from models import App as AppModel
                 from config import Settings
-                from services import app_service
+                from services import ai_service, app_service
                 db_gen = SL()
                 try:
                     app = db_gen.query(AppModel).filter(AppModel.id == app_id).first()
-                    with patch.object(ai_service, "stream_chat_events", slow_stream):
+                    with patch.object(
+                        app_service.code_service,
+                        "generate_static_frontend_with_opencode",
+                        return_value=[{"path": "index.html", "content": "<!doctype html><html><body>Hello</body></html>"}],
+                    ):
                         with patch.object(ai_service, "non_streaming_chat_with_usage", return_value=ai_service.ChatResult(content="测试")):
                             async for _ in app_service.handle_chat(app, "生成测试页", db_gen, Settings()):
                                 pass

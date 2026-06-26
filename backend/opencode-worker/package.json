@@ -1,0 +1,11 @@
+{
+  "name": "quick-da-opencode-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "2.0.52",
+    "@opencode-ai/sdk": "1.17.11",
+    "opencode-ai": "1.17.11"
+  }
+}

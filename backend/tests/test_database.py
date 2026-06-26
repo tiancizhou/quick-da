@@ -159,7 +159,7 @@ class DatabaseConfigurationTestCase(unittest.TestCase):
             self.assertIn("users", tables)
             self.assertIn("app_data_records", tables)
             self.assertIn("llm_settings", tables)
-            self.assertEqual("0003_llm_settings", version)
+            self.assertEqual("0004_opencode_sessions", version)
             backups = list(Path(tmp.name).glob("quickapp.db.legacy-*.bak"))
             self.assertEqual([], backups)
         finally:
@@ -284,6 +284,17 @@ class ModelMetadataTestCase(unittest.TestCase):
         self.assertIn("project_type", columns)
         self.assertIn("visibility", columns)
         self.assertIn("preview_token", columns)
+        self.assertIn("opencode_session_id", columns)
+        self.assertIn("opencode_workspace", columns)
+
+    def test_opencode_events_have_session_replay_columns(self):
+        columns = self.models.OpenCodeEvent.__table__.columns
+        self.assertIn("app_id", columns)
+        self.assertIn("sequence", columns)
+        self.assertIn("event_type", columns)
+        self.assertIn("payload", columns)
+        index_names = {index.name for index in self.models.OpenCodeEvent.__table__.indexes}
+        self.assertIn("ix_opencode_events_app_sequence", index_names)
 
     def test_sessions_have_audit_columns(self):
         columns = self.models.SessionToken.__table__.columns

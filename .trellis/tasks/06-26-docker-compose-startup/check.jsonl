@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Review Docker startup against backend runtime constraints."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Check settings, secrets, and verification expectations."}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Review production frontend asset serving contract."}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "Check frontend build contract used by Dockerfile."}

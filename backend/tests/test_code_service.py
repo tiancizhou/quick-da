@@ -37,6 +37,30 @@ def next_files(page_content: str = "export default function Page() { return <mai
     ]
 
 
+def react_files():
+    return [
+        {
+            "path": "package.json",
+            "content": json.dumps({
+                "scripts": {"dev": "vite", "build": "vite build", "preview": "vite preview"},
+                "dependencies": {
+                    "react": "latest",
+                    "react-dom": "latest",
+                    "vite": "latest",
+                    "typescript": "latest",
+                    "@vitejs/plugin-react": "latest",
+                    "appwrite": "latest",
+                },
+            }),
+        },
+        {"path": "index.html", "content": "<div id=\"root\"></div><script type=\"module\" src=\"/src/main.tsx\"></script>"},
+        {"path": "src/main.tsx", "content": "import React from 'react'; import { createRoot } from 'react-dom/client'; import App from './App'; createRoot(document.getElementById('root')!).render(<App />);"},
+        {"path": "src/App.tsx", "content": "export default function App() { return <main>ok</main>; }"},
+        {"path": "src/lib/appwrite.ts", "content": "import { Client } from 'appwrite'; export const client = new Client().setEndpoint(import.meta.env.VITE_APPWRITE_ENDPOINT).setProject(import.meta.env.VITE_APPWRITE_PROJECT_ID);"},
+        {"path": ".env.example", "content": "VITE_APPWRITE_ENDPOINT=\nVITE_APPWRITE_PROJECT_ID=\n"},
+    ]
+
+
 class BuildPatch:
     def __enter__(self):
         self.original = code_service.build_static_export
@@ -184,6 +208,40 @@ class ProjectCodeServiceTestCase(unittest.TestCase):
             self.assertFalse((project_dir / "app" / "page.tsx").exists())
             self.assertEqual(sorted(files, key=lambda item: item["path"]), code_service.read_project_files("app-1", tmpdir))
 
+    def test_save_static_frontend_publishes_files_without_build(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = [
+                {"path": "index.html", "content": "<!doctype html><html><body><script src=\"app.js\"></script></body></html>"},
+                {"path": "app.js", "content": "document.body.dataset.ready = 'true'"},
+                {"path": "styles.css", "content": "body { margin: 0; }"},
+            ]
+
+            project_dir = code_service.save_static_frontend("app-1", files, tmpdir)
+
+            self.assertEqual(Path(tmpdir) / "apps" / "app-1" / "project", project_dir)
+            self.assertEqual(files[0]["content"], (project_dir / "index.html").read_text(encoding="utf-8"))
+            self.assertEqual(files[1]["content"], (project_dir / "app.js").read_text(encoding="utf-8"))
+            self.assertFalse((Path(tmpdir) / "apps" / "app-1" / "source").exists())
+
+    def test_save_static_frontend_requires_index_html(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(code_service.ProjectValidationError, "index.html"):
+                code_service.save_static_frontend("app-1", [{"path": "app.js", "content": "console.log('x')"}], tmpdir)
+
+    def test_save_frontend_source_accepts_react_project_without_build(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = code_service.save_frontend_source("app-1", react_files(), tmpdir)
+
+            self.assertEqual(Path(tmpdir) / "apps" / "app-1" / "source", source_dir)
+            self.assertTrue((source_dir / "src" / "App.tsx").is_file())
+            self.assertTrue((source_dir / "src" / "lib" / "appwrite.ts").is_file())
+            self.assertFalse((Path(tmpdir) / "apps" / "app-1" / "project").exists())
+
+    def test_save_frontend_source_rejects_single_html_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(code_service.ProjectValidationError, "React 前端源码"):
+                code_service.save_frontend_source("app-1", [{"path": "index.html", "content": "<html></html>"}], tmpdir)
+
     def test_save_changes_updates_source_and_rebuilds_preview(self):
         with tempfile.TemporaryDirectory() as tmpdir, BuildPatch():
             project_dir = code_service.save_project("app-1", next_files("export default function Page() { return <main>old</main> }"), tmpdir)
@@ -264,7 +322,7 @@ class ProjectCodeServiceTestCase(unittest.TestCase):
                 *next_files(),
                 *[
                     {"path": f"app/existing/{i}.tsx", "content": "export default function X() { return null }"}
-                    for i in range(9)
+                    for i in range(30)
                 ],
             ]
             code_service.save_project("app-1", original_files, tmpdir)

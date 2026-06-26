@@ -128,6 +128,8 @@ class App(Base):
     project_type = Column(String(20), nullable=False, default="project")
     visibility = Column(String(20), nullable=False, default="private")
     preview_token = Column(String(64), nullable=True, unique=True)
+    opencode_session_id = Column(String(100), nullable=True)
+    opencode_workspace = Column(String(500), nullable=True)
     created_at = Column(DB_DATETIME, nullable=False, default=now_utc)
     updated_at = Column(DB_DATETIME, nullable=False, default=now_utc, onupdate=now_utc)
     version = Column(Integer, nullable=False, default=0)
@@ -146,6 +148,21 @@ class Conversation(Base):
     content = Column(Text, nullable=False)
     created_at = Column(DB_DATETIME, nullable=False, default=now_utc)
     updated_at = Column(DB_DATETIME, nullable=False, default=now_utc, onupdate=now_utc)
+
+
+class OpenCodeEvent(Base):
+    __tablename__ = "opencode_events"
+    __table_args__ = (
+        Index("ix_opencode_events_app_sequence", "app_id", "sequence"),
+        Index("ix_opencode_events_app_created", "app_id", "created_at"),
+    )
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    app_id = Column(String(36), ForeignKey("apps.id", ondelete="CASCADE"), nullable=False)
+    sequence = Column(Integer, nullable=False)
+    event_type = Column(String(50), nullable=False)
+    payload = Column(Text, nullable=False)
+    created_at = Column(DB_DATETIME, nullable=False, default=now_utc)
 
 
 class UsageRecord(Base):
@@ -232,6 +249,7 @@ class AppResponse(BaseModel):
     project_type: str
     visibility: str
     preview_token: Optional[str]
+    opencode_session_id: Optional[str]
     created_at: datetime
     updated_at: datetime
     version: int

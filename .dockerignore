@@ -1,0 +1,15 @@
+.git
+.trellis
+.claude
+.tmp
+backend/.venv
+backend/__pycache__
+backend/.pytest_cache
+backend/quickapp.db
+backend/data
+backend/static
+backend/opencode-worker/node_modules
+frontend/node_modules
+frontend/dist
+*.pyc
+.env

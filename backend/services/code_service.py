@@ -1,9 +1,13 @@
 import json
+import queue
 import re
 import shutil
 import subprocess
+import threading
+import time
 import uuid
 from pathlib import Path
+from typing import Callable
 
 ALLOWED_PROJECT_SUFFIXES = {
     ".html",
@@ -25,8 +29,8 @@ ALLOWED_PROJECT_SUFFIXES = {
     ".map",
     ".avif",
 }
-ALLOWED_SOURCE_SUFFIXES = ALLOWED_PROJECT_SUFFIXES | {".ts", ".tsx", ".jsx"}
-MAX_PROJECT_FILES = 20
+ALLOWED_SOURCE_SUFFIXES = ALLOWED_PROJECT_SUFFIXES | {".ts", ".tsx", ".jsx", ".example"}
+MAX_PROJECT_FILES = 40
 MAX_CHANGE_FILES = 10
 MAX_FILE_BYTES = 300 * 1024
 REQUIRED_NEXT_SOURCE_PATHS = {
@@ -38,6 +42,12 @@ REQUIRED_NEXT_SOURCE_PATHS = {
     "app/page.tsx",
     "app/globals.css",
 }
+REQUIRED_REACT_SOURCE_PATHS = {
+    "package.json",
+    "index.html",
+    "src/main.tsx",
+    "src/App.tsx",
+}
 ALLOWED_PACKAGE_DEPENDENCIES = {
     "next",
     "react",
@@ -48,10 +58,17 @@ ALLOWED_PACKAGE_DEPENDENCIES = {
     "@types/react-dom",
 }
 ALLOWED_PACKAGE_SCRIPTS = {"dev", "build", "start"}
+ALLOWED_REACT_PACKAGE_SCRIPTS = {"dev", "build", "preview", "start"}
+SAFE_PACKAGE_NAME_PATTERN = re.compile(r"^(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$")
 SAFE_PACKAGE_VERSION_PATTERN = re.compile(
     r"^(latest|\^?\d+(?:\.\d+){0,2}(?:[-+][0-9A-Za-z.-]+)?|~\d+(?:\.\d+){0,2}(?:[-+][0-9A-Za-z.-]+)?)$"
 )
 BUILD_TIMEOUT_SECONDS = 180
+OPENCODE_TIMEOUT_SECONDS = 300
+OPENCODE_IDLE_TIMEOUT_MS = 8000
+OPENCODE_RUN_TIMEOUT_MS = 240000
+
+AgentEventCallback = Callable[[str, object], None]
 
 
 class ProjectValidationError(ValueError):
@@ -252,6 +269,229 @@ def project_dir_for(app_id: str, data_dir: str) -> Path:
 
 def source_dir_for(app_id: str, data_dir: str) -> Path:
     return _source_dir(app_id, data_dir)
+
+
+def save_static_frontend(app_id: str, files: list[dict[str, str]], data_dir: str) -> Path:
+    files = _require_valid_entries(files, MAX_PROJECT_FILES, source=False)
+    paths = {file["path"] for file in files}
+    if "index.html" not in paths:
+        raise ProjectValidationError("生成的前端项目缺少入口文件 index.html。")
+
+    project_dir = _project_dir(app_id, data_dir)
+    temp_project_dir = _temp_project_dir(project_dir)
+    project_backup_dir = _backup_project_dir(project_dir)
+    _write_project_files(temp_project_dir, files, source=False)
+    try:
+        _validate_static_export_dir(temp_project_dir)
+        return _replace_project_dir(project_dir, temp_project_dir, project_backup_dir)
+    except Exception:
+        _remove_dir_if_exists(temp_project_dir)
+        raise
+
+
+def save_frontend_source(app_id: str, files: list[dict[str, str]], data_dir: str) -> Path:
+    files = _require_valid_entries(files, MAX_PROJECT_FILES, source=True)
+    _validate_react_source_entries(files)
+
+    source_dir = _source_dir(app_id, data_dir)
+    temp_source_dir = _temp_project_dir(source_dir)
+    source_backup_dir = _backup_project_dir(source_dir)
+    _write_project_files(temp_source_dir, files, source=True)
+    try:
+        if source_dir.exists():
+            source_dir.rename(source_backup_dir)
+        temp_source_dir.rename(source_dir)
+    except Exception:
+        if source_dir.exists():
+            shutil.rmtree(source_dir)
+        if source_backup_dir.exists() and not source_dir.exists():
+            source_backup_dir.rename(source_dir)
+        raise
+    finally:
+        _remove_dir_if_exists(temp_source_dir)
+        _remove_dir_if_exists(source_backup_dir)
+    return source_dir
+
+
+def generate_static_frontend_with_opencode(
+    app_id: str,
+    prompt: str,
+    data_dir: str,
+    base_url: str,
+    model: str,
+    api_key: str,
+    on_event: AgentEventCallback | None = None,
+    reset_workspace: bool = False,
+) -> list[dict[str, str]]:
+    app_dir = Path(data_dir) / "apps" / app_id
+    workspace = app_dir / "opencode-workspace"
+    if reset_workspace:
+        _remove_dir_if_exists(workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    agents_file = workspace / "AGENTS.md"
+    if reset_workspace or not agents_file.exists():
+        agents_file.write_text(_opencode_agents_md(), encoding="utf-8")
+
+    worker_dir = Path(__file__).resolve().parents[1] / "opencode-worker"
+    payload = {
+        "workspace": str(workspace),
+        "prompt": prompt,
+        "baseURL": base_url,
+        "modelID": model,
+        "apiKey": api_key,
+        "maxIdleMs": OPENCODE_IDLE_TIMEOUT_MS,
+        "maxRunMs": OPENCODE_RUN_TIMEOUT_MS,
+    }
+    try:
+        process = subprocess.Popen(
+            ["node", str(worker_dir / "generate.mjs")],
+            cwd=worker_dir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(payload, ensure_ascii=False))
+        process.stdin.close()
+
+        parsed, stdout_lines = _consume_opencode_events(process, workspace, on_event)
+        stderr = process.stderr.read() if process.stderr is not None else ""
+        returncode = process.returncode if process.returncode is not None else process.wait(timeout=1)
+    except TimeoutError as exc:
+        try:
+            process.kill()
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            returncode = process.wait()
+        except Exception:
+            stderr = str(exc)
+        files = _read_frontend_workspace_files(workspace)
+        if _has_publishable_frontend_source(files):
+            if on_event:
+                on_event("agent", "OpenCode 仍在后台收尾，已先发布当前可用版本。\n")
+            return files
+        raise ProjectValidationError(f"OpenCode 智能体生成超时：{_short_error(stderr)}。") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ProjectValidationError(f"OpenCode 智能体启动失败：{_short_error(str(exc))}。") from exc
+
+    files = _read_frontend_workspace_files(workspace)
+    if returncode != 0 or not parsed.get("ok"):
+        if _has_publishable_frontend_source(files):
+            if on_event:
+                on_event("agent", "检测到可用前端源码，继续保存。\n")
+            return files
+        detail = parsed.get("error") or stderr or "\n".join(stdout_lines) or f"exit {returncode}"
+        raise ProjectValidationError(f"OpenCode 智能体生成失败：{_short_error(str(detail))}。")
+
+    return files
+
+
+def _consume_opencode_events(
+    process: subprocess.Popen,
+    workspace: Path,
+    on_event: AgentEventCallback | None,
+) -> tuple[dict[str, object], list[str]]:
+    assert process.stdout is not None
+    line_queue: queue.Queue[str | None] = queue.Queue()
+
+    def read_stdout() -> None:
+        try:
+            for line in process.stdout:
+                line_queue.put(line)
+        finally:
+            line_queue.put(None)
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+
+    parsed: dict[str, object] = {}
+    stdout_lines: list[str] = []
+    deadline = time.monotonic() + OPENCODE_TIMEOUT_SECONDS
+    while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError("OpenCode worker timed out")
+
+        try:
+            line = line_queue.get(timeout=0.2)
+        except queue.Empty:
+            if process.poll() is not None and line_queue.empty():
+                break
+            continue
+
+        if line is None:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        stdout_lines.append(line)
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            if on_event:
+                on_event("agent", line)
+            continue
+
+        event_type = event.get("type")
+        if event_type == "result":
+            parsed = event
+        elif event_type == "opencode":
+            if on_event:
+                on_event("opencode", event)
+        elif event_type in {"agent", "progress"}:
+            content = event.get("content")
+            if on_event and isinstance(content, str) and content:
+                on_event(str(event_type), content)
+
+    process.wait(timeout=1)
+    return parsed, stdout_lines
+
+
+def _read_frontend_workspace_files(workspace: Path) -> list[dict[str, str]]:
+    files: list[dict[str, str]] = []
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file():
+            continue
+        relative_path = path.relative_to(workspace).as_posix()
+        if (
+            relative_path == "AGENTS.md"
+            or relative_path.startswith(".git/")
+            or relative_path.startswith("node_modules/")
+            or relative_path.startswith("dist/")
+            or relative_path.startswith("build/")
+        ):
+            continue
+        if not is_safe_source_path(relative_path):
+            continue
+        if path.stat().st_size > MAX_FILE_BYTES:
+            continue
+        files.append({"path": relative_path, "content": path.read_text(encoding="utf-8")})
+        if len(files) >= MAX_PROJECT_FILES:
+            break
+    return _normalize_file_entries(files, MAX_PROJECT_FILES, "files", source=True)
+
+
+def _opencode_agents_md() -> str:
+    return """# QuickDa React Frontend Agent
+
+You are generating one production-oriented React frontend project.
+
+Requirements:
+- Write files directly into this directory.
+- Use Vite + React + TypeScript.
+- Create or update `package.json`, `index.html`, `src/main.tsx`, `src/App.tsx`, and supporting files under `src/`.
+- Do not run shell commands.
+- Do not install dependencies.
+- Do not execute a build.
+- Do not create backend server code.
+- Do not include secrets.
+- Use mobile-first responsive layout and ensure 375px width is usable.
+- When backend persistence, auth, files, or realtime are needed, integrate Appwrite from frontend code.
+- Read Appwrite settings from `VITE_APPWRITE_ENDPOINT`, `VITE_APPWRITE_PROJECT_ID`, `VITE_APPWRITE_DATABASE_ID`, and related environment variables.
+- You may create `.env.example` with placeholder values only.
+- Encapsulate Appwrite setup in `src/lib/appwrite.ts` when used.
+- Implement clear loading, empty, error, and offline states in the UI.
+"""
 
 
 def _project_dir(app_id: str, data_dir: str) -> Path:
@@ -485,6 +725,74 @@ def _validate_next_source_entries(files: list[dict[str, str]], required_prefix: 
     contents = {file["path"]: file["content"] for file in files}
     _validate_package_json(contents["package.json"], required_prefix)
     _validate_next_config(contents["next.config.ts"], required_prefix)
+
+
+def _has_publishable_frontend_source(files: list[dict[str, str]]) -> bool:
+    paths = {file["path"] for file in files}
+    return "index.html" in paths and (
+        REQUIRED_REACT_SOURCE_PATHS.issubset(paths)
+        or "src/main.jsx" in paths
+        or "src/main.js" in paths
+        or "app.js" in paths
+    )
+
+
+def _validate_react_source_entries(files: list[dict[str, str]]) -> None:
+    paths = {file["path"] for file in files}
+    if "index.html" not in paths:
+        raise ProjectValidationError("OpenCode 生成的前端源码缺少入口文件 index.html。")
+
+    has_react_main = any(path in paths for path in ["src/main.tsx", "src/main.jsx", "src/main.ts", "src/main.js"])
+    has_react_app = any(path in paths for path in ["src/App.tsx", "src/App.jsx", "src/App.ts", "src/App.js"])
+    if "package.json" in paths and (has_react_main or has_react_app):
+        contents = {file["path"]: file["content"] for file in files}
+        _validate_react_package_json(contents["package.json"])
+        return
+
+    missing = sorted(REQUIRED_REACT_SOURCE_PATHS - paths)
+    raise ProjectValidationError(f"OpenCode 没有生成可保存的 React 前端源码，缺少：{', '.join(missing)}。")
+
+
+def _validate_react_package_json(content: str) -> None:
+    try:
+        package_data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ProjectValidationError("OpenCode 生成的 package.json 不是有效 JSON。") from exc
+    if not isinstance(package_data, dict):
+        raise ProjectValidationError("OpenCode 生成的 package.json 格式不正确。")
+
+    scripts = package_data.get("scripts") or {}
+    if not isinstance(scripts, dict):
+        raise ProjectValidationError("OpenCode 生成的 package.json scripts 格式不正确。")
+    unsupported_scripts = sorted(set(scripts) - ALLOWED_REACT_PACKAGE_SCRIPTS)
+    if unsupported_scripts:
+        raise ProjectValidationError(f"OpenCode 生成的 package.json 包含不支持的脚本：{', '.join(unsupported_scripts)}。")
+    for script_name, command in scripts.items():
+        if not isinstance(command, str):
+            raise ProjectValidationError(f"OpenCode 生成的 package.json 脚本格式不正确：{script_name}。")
+        lowered = command.lower()
+        if any(token in lowered for token in ["curl ", "wget ", "powershell", "bash ", "sh ", "node -e", "rm -rf"]):
+            raise ProjectValidationError(f"OpenCode 生成的 package.json 脚本包含不安全命令：{script_name}。")
+    if "build" in scripts and "vite build" not in scripts["build"]:
+        raise ProjectValidationError("OpenCode 生成的 package.json build 脚本应使用 vite build。")
+
+    dependencies: set[str] = set()
+    for field_name in ["dependencies", "devDependencies"]:
+        value = package_data.get(field_name) or {}
+        if not isinstance(value, dict):
+            raise ProjectValidationError(f"OpenCode 生成的 package.json {field_name} 格式不正确。")
+        for name, version in value.items():
+            if not isinstance(name, str) or not isinstance(version, str):
+                raise ProjectValidationError(f"OpenCode 生成的 package.json {field_name} 依赖格式不正确。")
+            if not SAFE_PACKAGE_NAME_PATTERN.match(name):
+                raise ProjectValidationError(f"OpenCode 生成的 package.json 依赖名称不安全：{name}。")
+            if not SAFE_PACKAGE_VERSION_PATTERN.match(version):
+                raise ProjectValidationError(f"OpenCode 生成的 package.json 依赖版本不安全或不支持：{name}。")
+            dependencies.add(name)
+
+    missing = sorted({"react", "react-dom"} - dependencies)
+    if missing:
+        raise ProjectValidationError(f"OpenCode 生成的 package.json 缺少必要依赖：{', '.join(missing)}。")
 
 
 def _validate_package_json(content: str, required_prefix: str) -> None:

@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend runtime and production static serving constraints for Docker startup."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Required configurable settings and backend verification expectations."}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Frontend production build output and cross-layer serving context."}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "Frontend build command and static output contract."}

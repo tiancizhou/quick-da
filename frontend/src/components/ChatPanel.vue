@@ -126,6 +126,7 @@
               :key="i"
               :role="msg.role"
               :content="msg.content"
+              :opencode-events="msg.opencodeEvents"
               :result-url="msg.resultUrl"
               :result-status="msg.resultStatus"
               :result-error="msg.resultError"
@@ -276,7 +277,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick, onMounted, onUnmounted } from "vue"
 import MessageBubble from "./MessageBubble.vue"
-import { createApp, getApp, getAppPreview, listConversations, sendChat, setAppStyle, type App, type DevicePreference, type Style } from "../api/index"
+import { createApp, getApp, getAppPreview, listConversations, listOpenCodeEvents, sendChat, setAppStyle, type App, type DevicePreference, type OpenCodeStreamEvent, type Style } from "../api/index"
 
 const props = withDefaults(defineProps<{
   selectedAppId: string | null
@@ -294,6 +295,7 @@ const emit = defineEmits<{
 interface Message {
   role: "user" | "assistant"
   content: string
+  opencodeEvents?: OpenCodeStreamEvent[]
   resultUrl?: string | null
   resultStatus?: string | null
   resultError?: string | null
@@ -353,7 +355,7 @@ const heroStyle = computed(() => ({
 const previewUrl = computed(() => {
   if (!currentAppId.value || !currentApp.value) return null
   if (currentApp.value.status === "active" || (currentApp.value.status === "editing" && currentApp.value.version > 0) || currentApp.value.status === "edit_failed") {
-    return cacheBustPreviewUrl(currentPreviewBaseUrl.value || projectPreviewUrl(currentAppId.value), currentApp.value.version)
+    return currentPreviewBaseUrl.value ? cacheBustPreviewUrl(currentPreviewBaseUrl.value, currentApp.value.version) : null
   }
   return null
 })
@@ -432,9 +434,10 @@ async function loadSelectedApp(newId: string | null) {
   isChatCollapsed.value = false
 
   try {
-    const [app, conversations] = await Promise.all([
+    const [app, conversations, opencodeRecords] = await Promise.all([
       getApp(newId),
       listConversations(newId),
+      listOpenCodeEvents(newId).catch(() => []),
     ])
     currentApp.value = app
     selectedStyleId.value = app.style_id || null
@@ -460,11 +463,26 @@ async function loadSelectedApp(newId: string | null) {
         role: conversation.role as "user" | "assistant",
         content: conversation.role === "assistant" ? normalizeHistoricalAssistantContent(conversation.content) : conversation.content,
       }))
+    const historicalOpenCodeEvents = opencodeRecords
+      .map((record) => record.payload)
+      .filter((event): event is OpenCodeStreamEvent => Boolean(event && typeof event === "object" && typeof event.kind === "string"))
 
     const lastAssistant = [...loadedMessages].reverse().find((message) => message.role === "assistant")
     if (lastAssistant) {
+      if (historicalOpenCodeEvents.length) {
+        lastAssistant.opencodeEvents = historicalOpenCodeEvents
+        lastAssistant.content = ""
+      }
       lastAssistant.resultStatus = app.status
-      lastAssistant.resultUrl = app.status === "active" ? cacheBustPreviewUrl(currentPreviewBaseUrl.value || projectPreviewUrl(newId), app.version) : null
+      lastAssistant.resultUrl = app.status === "active" && currentPreviewBaseUrl.value ? cacheBustPreviewUrl(currentPreviewBaseUrl.value, app.version) : null
+    } else if (historicalOpenCodeEvents.length) {
+      loadedMessages.push({
+        role: "assistant",
+        content: "",
+        opencodeEvents: historicalOpenCodeEvents,
+        resultStatus: app.status,
+        resultUrl: app.status === "active" && currentPreviewBaseUrl.value ? cacheBustPreviewUrl(currentPreviewBaseUrl.value, app.version) : null,
+      })
     }
     if (app.status === "creating") {
       if (!lastAssistant) {
@@ -550,6 +568,18 @@ async function sendMessage() {
           setAppProgress(appId, progress)
         }
       },
+      // onOpenCode
+      async (event) => {
+        const appMessages = messageCache.value[appId]
+        const last = appMessages?.[appMessages.length - 1]
+        if (last && last.role === "assistant") {
+          last.opencodeEvents = [...(last.opencodeEvents || []), event]
+        }
+        if (currentAppId.value === appId) {
+          messages.value = appMessages
+          await scrollToBottom()
+        }
+      },
       // onResult
       async (url, status, error) => {
         clearAppProgress(appId)
@@ -567,8 +597,8 @@ async function sendMessage() {
           emit("app-updated", updatedApp)
         }
         if (last && last.role === "assistant") {
-          last.content = status === "active" ? "应用已生成或更新，可以在右侧预览。" : normalizeGeneratedContent(last.content, status)
-          last.resultUrl = status === "active" ? resultPreviewUrl(appId, url, updatedApp?.version) : null
+          last.content = status === "active" && last.opencodeEvents?.length ? last.content : (status === "active" ? normalizeSuccessfulContent(last.content) : normalizeGeneratedContent(last.content, status))
+          last.resultUrl = status === "active" && previewAvailable(appId, url) ? resultPreviewUrl(appId, url, updatedApp?.version) : null
           last.resultStatus = status
           last.resultError = error
         }
@@ -624,6 +654,17 @@ async function resumeGeneratingApp(appId: string) {
       (progress) => {
         setAppProgress(appId, progress)
       },
+      async (event) => {
+        const currentMessages = messageCache.value[appId]
+        const target = currentMessages?.[resumeStreams[appId]?.messageIndex ?? -1]
+        if (target && target.role === "assistant") {
+          target.opencodeEvents = [...(target.opencodeEvents || []), event]
+        }
+        if (currentAppId.value === appId) {
+          messages.value = currentMessages
+          await scrollToBottom()
+        }
+      },
       async (url, status, error) => {
         clearAppProgress(appId)
         const currentMessages = messageCache.value[appId]
@@ -642,8 +683,8 @@ async function resumeGeneratingApp(appId: string) {
           }
         }
         if (target && target.role === "assistant") {
-          target.content = status === "active" ? "应用已生成或更新，可以在右侧预览。" : normalizeGeneratedContent(target.content, status)
-          target.resultUrl = status === "active" ? resultPreviewUrl(appId, url, updatedApp?.version) : null
+          target.content = status === "active" && target.opencodeEvents?.length ? target.content : (status === "active" ? normalizeSuccessfulContent(target.content) : normalizeGeneratedContent(target.content, status))
+          target.resultUrl = status === "active" && previewAvailable(appId, url) ? resultPreviewUrl(appId, url, updatedApp?.version) : null
           target.resultStatus = status
           target.resultError = error
         }
@@ -677,6 +718,10 @@ function resultPreviewUrl(appId: string, url: string | null, version?: number | 
   return cacheBustPreviewUrl(url || currentPreviewBaseUrl.value || projectPreviewUrl(appId), version)
 }
 
+function previewAvailable(_appId: string, url: string | null): boolean {
+  return Boolean(url || currentPreviewBaseUrl.value || false)
+}
+
 async function refreshPreviewBaseUrl(appId: string, app: App, fallbackUrl?: string | null): Promise<void> {
   if (!["active", "editing", "edit_failed"].includes(app.status) || app.version <= 0) return
   if (fallbackUrl) {
@@ -687,19 +732,59 @@ async function refreshPreviewBaseUrl(appId: string, app: App, fallbackUrl?: stri
     const preview = await getAppPreview(appId)
     currentPreviewBaseUrl.value = preview.url
   } catch {
-    currentPreviewBaseUrl.value = projectPreviewUrl(appId)
+    currentPreviewBaseUrl.value = null
   }
 }
 
 function normalizeGeneratedContent(content: string, status: string): string {
   if (status === "active" && looksLikeGeneratedArtifact(content)) return "应用已生成或更新，可以在右侧预览。"
   if (status !== "active" && content.length > 3000 && looksLikeGeneratedArtifact(content)) return "生成失败，模型返回的项目格式无法解析。请调整需求后重试。"
-  return content
+  return normalizeAgentActivityContent(content)
+}
+
+function normalizeSuccessfulContent(content: string): string {
+  const trimmed = normalizeAgentActivityContent(content).trim()
+  if (!trimmed || looksLikeGeneratedArtifact(trimmed)) return "应用已生成或更新，可以在右侧预览。"
+  if (trimmed.includes("可以在右侧预览")) return trimmed
+  return `${trimmed}\n\n应用已生成或更新，可以在右侧预览。`
 }
 
 function normalizeHistoricalAssistantContent(content: string): string {
   if (looksLikeGeneratedArtifact(content)) return "应用已生成或更新，可以在右侧预览。"
-  return content
+  return normalizeAgentActivityContent(content)
+}
+
+function normalizeAgentActivityContent(content: string): string {
+  const lines = content
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  if (!lines.some((line) => line.includes("OpenCode") || line.includes("opencode-workspace") || line.includes("静态前端"))) {
+    return content
+  }
+
+  const cleaned = lines
+    .filter((line) => !line.includes("请作为一个前端代码智能体"))
+    .filter((line) => !line.includes("只允许生成浏览器"))
+    .filter((line) => !line.includes("必须创建或更新"))
+    .filter((line) => !line.includes("不要运行 npm"))
+    .filter((line) => !line.includes("生成结果会通过"))
+    .filter((line) => !line.includes("请确保移动端"))
+    .filter((line) => !line.includes("设备布局目标"))
+    .filter((line) => !line.includes("历史对话"))
+    .filter((line) => !line.startsWith("user:"))
+    .filter((line) => !line.includes("本次用户需求"))
+    .map((line) => line
+      .replace(/app\/data\/apps\/[0-9a-f-]+\/opencode-workspace\/?/gi, "")
+      .replace(/.*opencode-workspace\/?/gi, "")
+      .replace(/^已完成：\s*$/g, "完成：检查工作区")
+      .replace(/^完成：\s*$/g, "完成：检查工作区")
+      .replace(/^已写入：/g, "写入文件：")
+      .trim())
+    .filter(Boolean)
+
+  return cleaned.length ? cleaned.join("\n") : "应用已生成或更新，可以在右侧预览。"
 }
 
 function looksLikeGeneratedArtifact(content: string): boolean {
@@ -765,13 +850,26 @@ function startStatusPolling(appId: string) {
 
       let loadedMessages: Message[] = []
       try {
-        const conversations = await listConversations(appId)
+        const [conversations, opencodeRecords] = await Promise.all([
+          listConversations(appId),
+          listOpenCodeEvents(appId).catch(() => []),
+        ])
+        const historicalOpenCodeEvents = opencodeRecords
+          .map((record) => record.payload)
+          .filter((event): event is OpenCodeStreamEvent => Boolean(event && typeof event === "object" && typeof event.kind === "string"))
         loadedMessages = conversations
           .filter((conversation) => conversation.role === "user" || conversation.role === "assistant")
           .map((conversation) => ({
             role: conversation.role as "user" | "assistant",
-            content: conversation.content,
+            content: conversation.role === "assistant" ? normalizeHistoricalAssistantContent(conversation.content) : conversation.content,
           }))
+        const lastAssistant = [...loadedMessages].reverse().find((message) => message.role === "assistant")
+        if (lastAssistant && historicalOpenCodeEvents.length) {
+          lastAssistant.opencodeEvents = historicalOpenCodeEvents
+          lastAssistant.content = ""
+        } else if (!lastAssistant && historicalOpenCodeEvents.length) {
+          loadedMessages.push({ role: "assistant", content: "", opencodeEvents: historicalOpenCodeEvents })
+        }
       } catch {
         loadedMessages = messageCache.value[appId] || messages.value
       }
@@ -782,12 +880,14 @@ function startStatusPolling(appId: string) {
 
       const lastAssistant = [...loadedMessages].reverse().find((message) => message.role === "assistant")
       if (lastAssistant) {
-        lastAssistant.content = normalizeGeneratedContent(lastAssistant.content, app.status)
-          || (app.status === "active" ? "应用已生成或更新，可以在右侧预览。" : "生成失败，请重新描述需求后再试。")
+        if (!lastAssistant.opencodeEvents?.length) {
+          lastAssistant.content = normalizeGeneratedContent(lastAssistant.content, app.status)
+            || (app.status === "active" ? "应用已生成或更新，可以在右侧预览。" : "生成失败，请重新描述需求后再试。")
+        }
         lastAssistant.resultStatus = app.status
-        lastAssistant.resultUrl = app.status === "active" || app.status === "edit_failed" ? cacheBustPreviewUrl(currentPreviewBaseUrl.value || projectPreviewUrl(appId), app.version) : null
+        lastAssistant.resultUrl = (app.status === "active" || app.status === "edit_failed") && currentPreviewBaseUrl.value ? cacheBustPreviewUrl(currentPreviewBaseUrl.value, app.version) : null
       } else if (app.status === "active") {
-        loadedMessages.push({ role: "assistant", content: "应用已生成或更新，可以在右侧预览。", resultStatus: "active", resultUrl: cacheBustPreviewUrl(currentPreviewBaseUrl.value || projectPreviewUrl(appId), app.version) })
+        loadedMessages.push({ role: "assistant", content: "源码已生成并保存。", resultStatus: "active", resultUrl: currentPreviewBaseUrl.value ? cacheBustPreviewUrl(currentPreviewBaseUrl.value, app.version) : null })
       }
 
       messageCache.value[appId] = loadedMessages
